@@ -123,6 +123,7 @@ class SyncplayClient(object):
         self.playerPositionBeforeLastSeek = 0.0
         self.setUsername(config['name'])
         self.setRoom(config['room'])
+        self._rawServerPassword = config['password']
         if config['password']:
             config['password'] = hashlib.md5(config['password'].encode('utf-8')).hexdigest()
         self._serverPassword = config['password']
@@ -134,6 +135,10 @@ class SyncplayClient(object):
             self.__getUserlistOnLogon = False
         self._playerClass = playerClass
         self._config = config
+        self.startedFromStartPage = False
+        self._connectionFailureHandled = False
+        self._returningToStartPage = False
+        self._sessionEnded = False
 
         self._running = False
         self._askPlayerTimer = None
@@ -841,6 +846,9 @@ class SyncplayClient(object):
     def getConfig(self):
         return self._config
 
+    def getRawServerPassword(self):
+        return self._rawServerPassword
+
     def getUserList(self):
         if self._protocol and self._protocol.logged:
             self._protocol.sendList()
@@ -887,6 +895,7 @@ class SyncplayClient(object):
         if self._running:
             return
         self._running = True
+        self._connectionFailureHandled = False
         if self._playerClass:
             perPlayerArguments = utils.getPlayerArgumentsByPathAsArray(self._config['perPlayerArguments'], self._config['playerPath'])
             if perPlayerArguments:
@@ -918,9 +927,7 @@ class SyncplayClient(object):
             if retries == 0:
                 self.onDisconnect()
             if retries > constants.RECONNECT_RETRIES:
-                reactor.callLater(0.1, self.ui.showErrorMessage, getMessage("connection-failed-notification"),
-                                  True)
-                reactor.callLater(0.1, self.stop, True)
+                self._connectionFailed(getMessage("connection-failed-notification"))
                 return None
 
             return(0.1 * (2 ** min(retries, 5)))
@@ -938,16 +945,112 @@ class SyncplayClient(object):
             return
 
         def failed(f):
-            reactor.callLater(0.1, self.ui.showErrorMessage, getMessage("connection-failed-notification"), True)
-            reactor.callLater(0.1, self.stop, True)
+            self._connectionFailed(getMessage("connection-failed-notification"))
 
         connectionHandle = waitForConnection.addCallbacks(connectedNow, failed)
         message = getMessage("connection-attempt-notification").format(host, port)
         self.ui.showMessage(message)
-        reactor.run()
+        if not reactor.running:
+            reactor.run()
+
+    def _connectionFailed(self, message):
+        """
+        Handle a connection failure.
+
+        When the client was started from the start page (the configuration
+        window), the user is sent back to it so that the settings can be
+        corrected and a new connection attempted, instead of terminating the
+        application. Otherwise the application is closed, as before.
+        """
+        if self._connectionFailureHandled:
+            return
+        self._connectionFailureHandled = True
+        if self.startedFromStartPage:
+            self._endSession(message)
+        else:
+            reactor.callLater(0.1, self.ui.showErrorMessage, message, True)
+            reactor.callLater(0.1, self.stop, True)
+
+    def disconnect(self):
+        """
+        Disconnect from the server and release the associated resources
+        without stopping the application, so that the user can return to the
+        start page, change the settings and connect again.
+        """
+        self._running = False
+        self.lastConnectTime = None
+        self._lastGlobalUpdate = None
+        if getattr(self, '_reconnectingService', None) is not None:
+            try:
+                if self._reconnectingService.running:
+                    self._reconnectingService.stopService()
+            except Exception:
+                pass
+        self.destroyProtocol()
+        try:
+            self.stopAutoplayCountdown()
+        except Exception:
+            pass
+        try:
+            self._warnings.stopAllTimers()
+        except Exception:
+            pass
+        try:
+            if self._askPlayerTimer is not None and self._askPlayerTimer.running:
+                self._askPlayerTimer.stop()
+        except Exception:
+            pass
+        if self._player:
+            try:
+                self._player.drop()
+            except Exception:
+                pass
+            self._player = None
+        try:
+            self.watched.flushQueueOnShutdown()
+        except Exception:
+            pass
+
+    def _endSession(self, errorMessage=None):
+        """
+        Leave the current session and go back to the start page (only once per
+        client). This is used when the connection fails or when the media
+        player is closed, so that the application keeps running.
+        """
+        if self._sessionEnded:
+            return
+        self._sessionEnded = True
+        # Deferred so that we are not inside a connection/player callback when
+        # the start page is displayed
+        reactor.callLater(0.1, self._returnToStartPage, errorMessage)
+
+    def returnToStartPage(self, errorMessage=None):
+        """
+        Disconnect from the server and return to the start page so that the
+        connection settings can be changed before connecting again.
+        """
+        if self._sessionEnded:
+            return
+        self._sessionEnded = True
+        self._returnToStartPage(errorMessage)
+
+    def _returnToStartPage(self, errorMessage=None):
+        if self._returningToStartPage:
+            return
+        self._returningToStartPage = True
+        try:
+            self.disconnect()
+            self.ui.returnToStartPage(errorMessage)
+        finally:
+            self._returningToStartPage = False
 
     def stop(self, promptForAction=False):
         if not self._running:
+            return
+        if self.startedFromStartPage:
+            # The media player was closed (or asked us to quit), so go back to
+            # the start page instead of terminating the application
+            self._endSession()
             return
         self._running = False
         self.destroyProtocol()
@@ -1261,6 +1364,17 @@ class SyncplayClient(object):
             self._checkIfYouReAloneInTheRoom(OSDOnly=False)
             self._checkRoomForSameFiles(OSDOnly=False)
             self.checkReadyStates()
+
+        def stopAllTimers(self):
+            try:
+                self.pausedTimer.stop()
+            except Exception:
+                pass
+            for warning in self._warnings.values():
+                try:
+                    warning['timer'].stop()
+                except Exception:
+                    pass
 
         def _checkRoomForSameFiles(self, OSDOnly):
             if not self._userlist.areAllFilesInRoomSame():
@@ -1828,6 +1942,14 @@ class UiManager(object):
 
     def executeCommand(self, command):
         self.__ui.executeCommand(command)
+
+    def returnToStartPage(self, errorMessage=None):
+        returnToStartPage = getattr(self.__ui, 'returnToStartPage', None)
+        if returnToStartPage is None:
+            # This UI has no start page (e.g. the console UI), so just quit
+            self._client.stop(True)
+        else:
+            returnToStartPage(errorMessage)
 
     def drop(self):
         self.__ui.drop()

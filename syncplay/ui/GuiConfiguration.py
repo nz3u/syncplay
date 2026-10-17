@@ -31,20 +31,23 @@ elif IsPySide2:
 
 
 class GuiConfiguration:
-    def __init__(self, config, error=None, defaultConfig=None):
+    def __init__(self, config, error=None, defaultConfig=None, exitOnClose=True):
         self.defaultConfig = defaultConfig
         self.config = config
         self._availablePlayerPaths = []
         self.error = error
+        self.dialog = None
+        self.exitOnClose = exitOnClose
         constants.DEBUG_MODE = config['debug']
 
     def run(self):
         if QCoreApplication.instance() is None:
             self.app = QtWidgets.QApplication(sys.argv)
-        dialog = ConfigDialog(self.config, self._availablePlayerPaths, self.error, self.defaultConfig)
+        self.dialog = ConfigDialog(self.config, self._availablePlayerPaths, self.error, self.defaultConfig, self.exitOnClose)
+        self.dialog.setWindowModality(Qt.WindowModal)
         configLoop = QEventLoop()
-        dialog.show()
-        dialog.closed.connect(configLoop.quit)
+        self.dialog.show()
+        self.dialog.closed.connect(configLoop.quit)
         configLoop.exec_()
 
     def setAvailablePaths(self, paths):
@@ -66,6 +69,7 @@ class GetPlayerIconThread(threading.Thread, QtCore.QObject):
         QtCore.QObject.__init__(self)
         self.condvar = threading.Condition()
         self.playerpath = None
+        self.stopped = False
 
     def setPlayerPath(self, playerpath):
         self.condvar.acquire()
@@ -75,18 +79,32 @@ class GetPlayerIconThread(threading.Thread, QtCore.QObject):
             self.condvar.notify()
         self.condvar.release()
 
+    def stop(self):
+        self.condvar.acquire()
+        self.stopped = True
+        self.playerpath = None
+        self.condvar.notify()
+        self.condvar.release()
+
     def run(self):
         while True:
             self.condvar.acquire()
-            if self.playerpath is None:
+            while self.playerpath is None and not self.stopped:
                 self.condvar.wait()
+            if self.stopped:
+                self.condvar.release()
+                return
             playerpath = self.playerpath
             self.playerpath = None
             self.condvar.release()
 
-            self.done.emit('spinner.mng', '')
-            iconpath = PlayerFactory().getPlayerIconByPath(playerpath)
-            self.done.emit(iconpath, playerpath)
+            try:
+                self.done.emit('spinner.mng', '')
+                iconpath = PlayerFactory().getPlayerIconByPath(playerpath)
+                self.done.emit(iconpath, playerpath)
+            except RuntimeError:
+                # The dialog has already been destroyed
+                return
 
 
 class ConfigDialog(QtWidgets.QDialog):
@@ -595,15 +613,30 @@ class ConfigDialog(QtWidgets.QDialog):
         self.close()
         self.closed.emit()
 
+    def cleanup(self):
+        """
+        Release the resources used by the dialog (the player icon probe thread
+        would otherwise keep running and keep the dialog object alive).
+        """
+        try:
+            self._playerProbeThread.stop()
+        except Exception:
+            pass
+
     def closeEvent(self, event):
         if self.pressedclosebutton:
             super(ConfigDialog, self).closeEvent(event)
             self.closed.emit()
-            sys.exit()
+            if self.exitOnClose:
+                sys.exit()
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Escape:
-            sys.exit()
+            if self.exitOnClose:
+                sys.exit()
+            else:
+                self.pressedclosebutton = True
+                self.close()
 
     def dragEnterEvent(self, event):
         data = event.mimeData()
@@ -1563,10 +1596,11 @@ class ConfigDialog(QtWidgets.QDialog):
 
         self.mainLayout.setMenuBar(self.menuBar)
 
-    def __init__(self, config, playerpaths, error, defaultConfig):
+    def __init__(self, config, playerpaths, error, defaultConfig, exitOnClose=True):
         self.config = config
         self.defaultConfig = defaultConfig
         self.playerpaths = playerpaths
+        self.exitOnClose = exitOnClose
         self.datacleared = False
         self.config['resetConfig'] = False
         self.subitems = {}

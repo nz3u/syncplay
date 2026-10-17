@@ -21,7 +21,7 @@ from syncplay.utils import formatTime, sameFilename, sameFilesize, sameFiledurat
 from syncplay.utils import getCorrectedPathForFile
 from syncplay.vendor import Qt
 from syncplay.vendor.Qt import QtCore, QtWidgets, QtGui, __binding__, __binding_version__, __qt_version__, IsPySide, IsPySide2, IsPySide6
-from syncplay.vendor.Qt.QtCore import Qt, QSettings, QSize, QPoint, QUrl, QLine, QDateTime
+from syncplay.vendor.Qt.QtCore import Qt, QSettings, QSize, QPoint, QUrl, QLine, QDateTime, QTimer
 applyDPIScaling = True
 if isLinux():
     applyDPIScaling = False
@@ -1206,11 +1206,139 @@ class MainWindow(QtWidgets.QMainWindow):
             self.showErrorMessage(getMessage("reconnect-failed-error").format(str(e)))
 
     def exitSyncplay(self):
-        self._syncplayClient.stop()
+        client = self._syncplayClient
+        if client is not None:
+            client.returnToStartPage()
+        elif not self._shuttingDown:
+            self._quitApplication()
+
+    def returnToStartPage(self, errorMessage=None):
+        """
+        Show the start page (the configuration window displayed when Syncplay is
+        started) again, so that the settings can be changed and a new connection
+        made without having to close and restart the whole application.
+        """
+        if self._returningToStartPage:
+            return
+        self._returningToStartPage = True
+        try:
+            client = self._syncplayClient
+            if client is None:
+                if not self.config:
+                    self._quitApplication()
+                    return
+                config = dict(self.config)
+            else:
+                config = dict(client.getConfig())
+                # The client has replaced the password with a hash of it
+                config['password'] = client.getRawServerPassword()
+            if config.get('password') is None:
+                config['password'] = ""
+            self._detachClient(client)
+            error = errorMessage
+            while True:
+                newConfig = self._showConfigurationDialog(config, error)
+                if newConfig is None:
+                    # The start page was closed: exit Syncplay completely
+                    self._quitApplication()
+                    return
+                error, config = self._connectWithConfig(newConfig)
+                if error is None:
+                    return
+                # Invalid settings: show the start page again with the error
+        finally:
+            self._returningToStartPage = False
+
+    def _detachClient(self, client):
+        if self.console:
+            self.console.addClient(None)
+        self.listTreeModel.removeRows(0, self.listTreeModel.rowCount())
+        self.currentRooms = []
+        self.playlistState = []
+        self.clearedPlaylistNote = False
+        self.playlist.clear()
+        if client is not None and client is self._syncplayClient:
+            self._syncplayClient = None
+        if client is not None:
+            try:
+                client.disconnect()
+            except Exception as e:
+                self.showDebugMessage("Error while disconnecting: {}".format(e))
+
+    def _showConfigurationDialog(self, config, error=None):
+        from syncplay.ui.GuiConfiguration import GuiConfiguration
+        from syncplay.players.playerFactory import PlayerFactory
+        self.hide()
+        # Closing this start page must not terminate the process directly: the
+        # application is closed by the caller so the reactor is stopped cleanly
+        guiConfiguration = GuiConfiguration(config, error=error, exitOnClose=False)
+        guiConfiguration.setAvailablePaths(PlayerFactory().getAvailablePlayerPaths())
+        try:
+            guiConfiguration.run()
+        except SystemExit:
+            return None
+        finally:
+            dialog = guiConfiguration.dialog
+            if dialog is not None:
+                dialog.cleanup()
+                dialog.deleteLater()
+        if guiConfiguration.dialog is not None and guiConfiguration.dialog.pressedclosebutton:
+            return None
+        return guiConfiguration.getProcessedConfiguration()
+
+    def _connectWithConfig(self, config):
+        """
+        Start a client with the given configuration.
+
+        Returns a tuple (errorMessage, configuration), where errorMessage is
+        None if the connection attempt was started.
+        """
+        from syncplay import clientManager
+        configuration, error = clientManager.prepareReconnectConfiguration(config)
+        if error is not None:
+            return error, configuration
+        config = configuration
+        from syncplay.client import SyncplayClient  # Imported later, so the proper reactor is used
+        try:
+            client = SyncplayClient(config['playerClass'], self, config)
+        except Exception as e:
+            return getMessage("reconnect-failed-error").format(str(e)), config
+        client.startedFromStartPage = True
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        try:
+            self.addClient(client)
+            client.start(config['host'], config['port'])
+        except Exception as e:
+            self._detachClient(client)
+            self.hide()
+            return getMessage("reconnect-failed-error").format(str(e)), config
+        return None, config
 
     def closeEvent(self, event):
-        self.exitSyncplay()
+        if self._shuttingDown:
+            self.saveSettings()
+            super(MainWindow, self).closeEvent(event)
+            return
+        # Handle the close from the event loop, as running the start page from
+        # within a close event would leave the window in a half-closed state
+        event.ignore()
+        self.hide()
+        if self._syncplayClient is None:
+            # There is no session to return from, so close the application
+            QTimer.singleShot(0, self._quitApplication)
+        else:
+            # Return to the start page instead of terminating the application
+            QTimer.singleShot(0, self.exitSyncplay)
+
+    def _quitApplication(self):
+        self._shuttingDown = True
         self.saveSettings()
+        self.close()
+        from twisted.internet import reactor
+        if reactor.running:
+            reactor.callLater(0.1, reactor.stop)
 
     def loadMediaBrowseSettings(self):
         settings = QSettings("Syncplay", "MediaBrowseDialog")
@@ -1605,6 +1733,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.QtGui.QDesktopServices.openUrl(QUrl("https://syncplay.pl/guide/"))
 
     def drop(self):
+        self._shuttingDown = True
         self.close()
 
     def getPlaylistState(self):
@@ -2329,6 +2458,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.publicServerList = []
         self.lastCheckedForUpdates = None
         self._syncplayClient = None
+        self.config = None
+        self._shuttingDown = False
+        self._returningToStartPage = False
         self.folderSearchEnabled = True
         self.hideEmptyRooms = False
         self.currentRooms = []

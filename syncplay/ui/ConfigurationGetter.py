@@ -18,6 +18,39 @@ class InvalidConfigValue(Exception):
         Exception.__init__(self, message)
 
 
+def splitPortAndHost(host, port):
+    port = constants.DEFAULT_PORT if not port else port
+    if host:
+        if ':' in host:
+            if host.count(':') == 1:
+                #IPv4 address or hostname, with port
+                host, port = host.rsplit(':', 1)
+                try:
+                    port = int(port)
+                except ValueError:
+                    try:
+                        port = port.encode('ascii', 'ignore')
+                    except:
+                        port = ""
+            else:
+                #IPv6 address
+                if ']' in host:
+                    #IPv6 address in brackets
+                    endBracket = host.index(']')
+                    try:
+                        #port explicitely indicated
+                        port = int(host[endBracket+2:])
+                    except ValueError:
+                        #no port after the bracket
+                        pass
+                    host = host[:endBracket+1]
+                else:
+                    #IPv6 address with no port and no brackets
+                    #add brackets to correctly store IPv6 addresses in configs
+                    host = '[' + host + ']'
+    return host, port
+
+
 class ConfigurationGetter(object):
     def __init__(self):
         self._config = {
@@ -345,36 +378,7 @@ class ConfigurationGetter(object):
                 self._config[key] = val
 
     def _splitPortAndHost(self, host):
-        port = constants.DEFAULT_PORT if not self._config["port"] else self._config["port"]
-        if host:
-            if ':' in host:
-                if host.count(':') == 1:
-                    #IPv4 address or hostname, with port
-                    host, port = host.rsplit(':', 1)
-                    try:
-                        port = int(port)
-                    except ValueError:
-                        try:
-                            port = port.encode('ascii', 'ignore')
-                        except:
-                            port = ""
-                else:
-                    #IPv6 address
-                    if ']' in host:
-                        #IPv6 address in brackets
-                        endBracket = host.index(']')
-                        try:
-                            #port explicitely indicated
-                            port = int(host[endBracket+2:])
-                        except ValueError:
-                            #no port after the bracket
-                            pass
-                        host = host[:endBracket+1]
-                    else:
-                        #IPv6 address with no port and no brackets
-                        #add brackets to correctly store IPv6 addresses in configs
-                        host = '[' + host + ']'
-        return host, port
+        return splitPortAndHost(host, self._config["port"])
 
     def _checkForPortableFile(self):
         path = utils.findWorkingDir()
@@ -460,6 +464,41 @@ class ConfigurationGetter(object):
                 return True
         else:
             return True
+
+    def getReconnectConfiguration(self, config):
+        """
+        Validate a configuration returned by the start page when returning to it
+        from a running session, and store it if requested.
+
+        Returns a tuple (configuration, errorMessage). If errorMessage is not
+        None, the configuration is invalid and the start page should be shown
+        again with that message and the returned configuration.
+        """
+        self._config = config
+        try:
+            self._validateArguments()
+        except InvalidConfigValue as e:
+            if config.get('resetConfig'):
+                # "Reset" was pressed: continue from the default settings, but
+                # keep the settings that describe where to store them
+                defaults = dict(self._defaultConfig)
+                defaults['language'] = config.get('language', '')
+                defaults['checkForUpdatesAutomatically'] = config.get('checkForUpdatesAutomatically')
+                defaults['configPath'] = config.get('configPath')
+                defaults['configDir'] = config.get('configDir')
+                defaults['resetConfig'] = True
+                self._config = defaults
+            return self._config, str(e)
+        except Exception as e:
+            # Never leave the user without a way back to the start page
+            return self._config, str(e)
+        try:
+            if self._config.get('configPath'):
+                self._saveConfig(self._config['configPath'])
+        except Exception:
+            # Failing to store the configuration should not prevent connecting
+            pass
+        return self._config, None
 
     def _saveConfig(self, iniPath):
         changed = False
