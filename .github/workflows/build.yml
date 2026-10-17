@@ -266,7 +266,6 @@ jobs:
         uses: actions/download-artifact@v6
         with:
           path: assets
-          merge-multiple: true
 
       - name: Prepare release assets
         shell: bash
@@ -277,20 +276,21 @@ jobs:
           DEBVER="${LABEL//-/_}"
           mkdir -p out
           copyAsset() {
-            if [ -f "assets/$1" ]; then
-              cp "assets/$1" "out/$2"
+            if [ -f "$1" ]; then
+              cp "$1" "out/$2"
             else
               echo "::warning::Missing build artifact $1, so $2 will not be attached"
             fi
           }
-          copyAsset "Syncplay-${VER}-Setup.exe" "Syncplay-${LABEL}-Setup.exe"
-          copyAsset "Syncplay_${VER}.dmg" "Syncplay_${LABEL}.dmg"
-          copyAsset "syncplay_${VER}.deb" "syncplay_${DEBVER}.deb"
-          copyAsset "syncplay-server_${VER}.deb" "syncplay-server_${DEBVER}.deb"
-          if [ -d "assets/syncplay_v${VER}" ]; then
-            (cd "assets/syncplay_v${VER}" && zip -qr "${GITHUB_WORKSPACE}/out/Syncplay_${LABEL}_Portable.zip" .)
+          copyAsset "assets/Syncplay-${VER}-x64-Setup.exe/Syncplay-${VER}-Setup.exe" "Syncplay-${LABEL}-Setup.exe"
+          copyAsset "assets/Syncplay_${VER}.dmg/Syncplay_${VER}.dmg" "Syncplay_${LABEL}.dmg"
+          copyAsset "assets/syncplay.deb/syncplay_${VER}.deb" "syncplay_${DEBVER}.deb"
+          copyAsset "assets/syncplay-server.deb/syncplay-server_${VER}.deb" "syncplay-server_${DEBVER}.deb"
+          PORTABLE="assets/Syncplay_${VER}_x64_Portable"
+          if [ -d "$PORTABLE" ]; then
+            (cd "$PORTABLE" && zip -qr "${GITHUB_WORKSPACE}/out/Syncplay_${LABEL}_Portable.zip" .)
           else
-            echo "::warning::Missing build artifact syncplay_v${VER}, so the portable zip will not be attached"
+            echo "::warning::Missing build artifact $PORTABLE, so the portable zip will not be attached"
           fi
           ls -l out
 
