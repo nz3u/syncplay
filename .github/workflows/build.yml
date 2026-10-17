@@ -301,11 +301,10 @@ jobs:
         run: |
           set -euo pipefail
           LABEL="${GITHUB_REF_NAME#v}"
+          TITLE="Syncplay ${LABEL}"
           if [[ "$LABEL" == *-* ]]; then
-            TITLE="Syncplay ${LABEL} (test)"
             PREFLAG="--prerelease"
           else
-            TITLE="Syncplay ${LABEL} (stable)"
             PREFLAG=""
           fi
           shopt -s nullglob
